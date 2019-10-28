@@ -1,0 +1,10 @@
+[package]
+name = "small-site"
+version = "0.1.0"
+authors = ["Gorm Casper <git@mail.gormcasper.dk>"]
+edition = "2018"
+
+[dependencies]
+markdown = "0.2"
+regex = "1"
+getopts = "0.2"
