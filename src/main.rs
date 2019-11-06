@@ -2,6 +2,7 @@ extern crate getopts;
 extern crate markdown;
 extern crate regex;
 use getopts::Options;
+mod reader;
 use regex::Regex;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -52,55 +53,36 @@ fn main() {
     // Ignore the error because it most likely will say dir already exists
     let _ = fs::create_dir(&dst_dir);
 
-    // Read templates into memory
-    let mut tpls: HashMap<String, String> = HashMap::new();
-    for path in read_dir(tpl_dir) {
-        // We want to store them under the key "file.html" and not "templates/file.html", because
-        // this is how it will be in the headers of the markdown files.
-        let k = match path.strip_prefix(tpl_dir) {
-            Ok(p) => p.to_string_lossy().to_string(),
-            Err(_) => continue,
-        };
-        let tpl = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => {
-                eprintln!("Could not read {:?}", &path);
-                continue;
-            }
-        };
-        tpls.insert(k, tpl);
-    }
+    let mut tpls = reader::FileReader::new();
 
     // We go through each file (incl. dirs) in the src dir. If we encounter any errors, we just
-    // cancel out and take the next file.
-    for file in read_dir(src_dir) {
-        let rel_path = match file.strip_prefix(src_dir) {
+    // log it and take the next file.
+    for path in read_dir(src_dir) {
+        // src/foo/bar --> foo/bar
+        let src_rel_path = match path.strip_prefix(src_dir) {
             Ok(p) => p,
             Err(_) => continue,
         };
 
-        // Write to this file/dir. Notice this will still have .md if it's a file.
-        let dst = dst_dir.join(rel_path);
-
-        if file.is_dir() {
+        if path.is_dir() {
+            // Create directory in ./public/
             // Ignore error because it is very likely to exist already.
-            let _ = fs::create_dir_all(&dst);
+            let _ = fs::create_dir_all(&dst_dir.join(src_rel_path));
             continue;
         }
+
+        let is_html = has_extension(&src_rel_path, "html");
+        let is_markdown = has_extension(&src_rel_path, "md");
 
         // Ignore any file that isn't html or markdown.
-        let extension = rel_path.extension();
-        let md_extesion = Some(OsStr::new("md"));
-        let html_extesion = Some(OsStr::new("html"));
-        let is_html = extension == html_extesion;
-        if extension != md_extesion && !is_html {
+        if !is_html && !is_markdown {
             continue;
         }
 
-        // .md -> .html
-        let dst_file = dst.with_extension("html");
+        let dst = dst_dir.join(src_rel_path).with_extension("html");
+        let result = convert_and_create(&path, &dst, &tpl_dir, is_markdown, &re, &mut tpls);
 
-        if let Err(e) = convert_and_create(&file, is_html, &dst_file, &re, &tpls) {
+        if let Err(e) = result {
             eprintln!("{}", e);
         }
     }
@@ -108,23 +90,41 @@ fn main() {
 
 fn convert_and_create(
     file: &Path,
-    is_html: bool,
     dst: &Path,
+    tpl_dir: &Path,
+    is_markdown: bool,
     re: &Regex,
-    tpls: &HashMap<String, String>,
+    tpls: &mut reader::FileReader,
 ) -> Result<(), String> {
     // Read content of src file
     let content = fs::read_to_string(&file)
         .map_err(|e| format!("Could not read {:?}. Got error: {}", &file, e))?;
 
     // Parse variables (at the top of the content file)
-    let (vars, content) = parse_file(&content, is_html);
+    let (vars, content) = match split_once(&content, "\n---") {
+        Some((h, c)) => (header_to_variables(h), c.to_string()),
+        None => (HashMap::new(), content),
+    };
+
+    // convert markdown to html if needed
+    let content = if is_markdown {
+        markdown::to_html(&content)
+    } else {
+        content
+    };
 
     // Get template
-    let tpl_file = vars.get("template").unwrap_or(&"default.html").to_string();
+    let tpl_path_rel = vars.get("template").unwrap_or(&"default.html");
     let tpl = tpls
-        .get(&tpl_file)
-        .ok_or_else(|| format!("Could not find template for {:?}", &file))?;
+        .get(tpl_dir.join(&tpl_path_rel))
+        .as_ref()
+        .ok_or_else(|| {
+            format!(
+                "Could not find template for {:?}. Searched here {:?}",
+                &file,
+                tpl_dir.join(&tpl_path_rel).display(),
+            )
+        })?;
 
     // Merge template and content
     let mut html = String::new();
@@ -172,26 +172,11 @@ fn convert_and_create(
     Ok(())
 }
 
-fn parse_file(content: &str, is_html: bool) -> (HashMap<&str, &str>, String) {
-    match split_once(&content, "\n---") {
-        Some((h, c)) => {
-            if is_html {
-                (header_to_variables(h), c.to_string())
-            } else {
-                (header_to_variables(h), markdown::to_html(&c))
-            }
-        }
-        None => {
-            if is_html {
-                (HashMap::new(), content.to_string())
-            } else {
-                (HashMap::new(), markdown::to_html(&content))
-            }
-        }
-    }
+fn has_extension(p: &Path, e: &str) -> bool {
+    Some(e) == p.extension().and_then(OsStr::to_str)
 }
 
-// foo=bar -> {"foo": "bar"}
+// a=b\nc=d --> {"a": "b", "c": "d"}
 fn header_to_variables(header: &str) -> HashMap<&str, &str> {
     let mut variables = HashMap::new();
 
@@ -205,7 +190,7 @@ fn header_to_variables(header: &str) -> HashMap<&str, &str> {
     return variables;
 }
 
-// split_once("a-b-c", "-") -> ("a", "b-c")
+// split_once("a-b-c", "-") --> ("a", "b-c")
 fn split_once<'a>(string: &'a str, splitter: &str) -> Option<(&'a str, &'a str)> {
     let mut splitter = string.splitn(2, splitter);
     let first = splitter.next()?.trim();
